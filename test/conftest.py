@@ -5,6 +5,12 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "long: mark test as long-running; skipped with --skiplong option"
     )
+    config.addinivalue_line(
+        "markers", "slow: mark test as slow (nbs_torch perf/statistical tests)"
+    )
+    config.addinivalue_line(
+        "markers", "gpu: mark test as requiring CUDA"
+    )
 
 
 def pytest_addoption(parser):
