@@ -1,0 +1,476 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+
+\definecolor{kw}{HTML}{0066AA}
+\definecolor{cm}{HTML}{888888}
+\definecolor{st}{HTML}{AA5500}
+\definecolor{bg}{HTML}{F7F7F7}
+
+\lstdefinestyle{py}{
+  language=Python,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cm}\itshape,
+  stringstyle=\color{st},
+  backgroundcolor=\color{bg},
+  showstringspaces=false,
+  breaklines=true,
+  numbers=left,
+  numberstyle=\tiny\color{cm},
+  numbersep=8pt,
+  frame=single,
+  framerule=0pt,
+  xleftmargin=18pt
+}
+\lstset{style=py}
+
+\title{The Network-Based Statistic in \texttt{bctpy}:\\
+A Line-by-Line Walkthrough and Computational-Cost Analysis}
+\author{Notes for the rchimera plots project}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document walks through the implementation of the Network-Based Statistic (NBS) in \texttt{bct/nbs.py} of the \texttt{bctpy} toolbox. The goal is to make every step --- input shape, vectorization, the per-edge $t$-test, the connected-components routine, the label-permutation procedure, and the empirical $p$-value computation --- explicit, and to attach a computational cost to each block so that the bottlenecks are identifiable on inspection. A companion document describes a \texttt{torch}-based reimplementation that targets those bottlenecks.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%==================================================================
+\section{Algorithm overview}
+
+The NBS \cite{Zalesky2010} is a non-parametric statistical test designed to identify a connected sub-network of edges in an undirected graph whose connectivity weights differ between two populations of subjects more than would be expected by chance. The four canonical steps are:
+
+\begin{enumerate}[leftmargin=2.0em]
+\item Compute a $t$-statistic at every edge of the connectivity graph.
+\item Threshold the $t$-statistics at a fixed cutoff $\tau$, producing a binary suprathreshold-edge graph.
+\item Find connected components of that graph; record the size of the largest one (in edges).
+\item Repeat steps 1--3 on $K$ random label-permuted datasets to build an empirical null distribution of the maximum component size; convert the observed component sizes to corrected $p$-values.
+\end{enumerate}
+
+In \texttt{bctpy}, this is implemented in a single function \texttt{nbs\_bct} occupying roughly 165 lines of Python. The version below is annotated with line numbers from \texttt{bct/nbs.py}.
+
+%==================================================================
+\section{Input data specification}
+
+\subsection{Shapes and semantics}
+
+The function signature is
+%
+\begin{lstlisting}
+def nbs_bct(x, y, thresh, k=1000, tail='both',
+            paired=False, verbose=False, seed=None):
+\end{lstlisting}
+%
+with input arrays:
+
+\begin{itemize}[leftmargin=2.0em]
+\item \texttt{x}: a \texttt{numpy.ndarray} of shape $(N, N, P)$, where $N$ is the number of nodes (regions of interest) and $P$ is the number of subjects in group~X. Each slice \texttt{x[:,:,i]} is the $N\times N$ \emph{symmetric} connectivity matrix for subject $i$.
+\item \texttt{y}: a \texttt{numpy.ndarray} of shape $(N, N, Q)$, with the analogous interpretation for group~Y. The first two dimensions must match \texttt{x}; $Q$ may differ from $P$ unless \texttt{paired=True}, in which case $Q=P$.
+\item \texttt{thresh}: a scalar primary threshold $\tau$ on the per-edge $t$-statistic.
+\item \texttt{k}: number of permutations $K$. Typical value $K=1000$.
+\item \texttt{tail}: $\{$\texttt{'both'}, \texttt{'left'}, \texttt{'right'}$\}$ --- alternative-hypothesis specification.
+\item \texttt{paired}: if \texttt{True}, use a paired $t$-statistic and a sign-flip permutation scheme.
+\end{itemize}
+
+\subsection{Typical magnitudes}
+
+In neuroimaging applications the typical regime is
+%
+\[
+N \in [60, 500], \qquad P, Q \in [10, 100], \qquad K \in [10^3, 10^4].
+\]
+%
+The number of upper-triangular edges is
+%
+\[
+m \;=\; \frac{N(N-1)}{2} \;\in\; [1.8\times10^3,\; 1.25\times10^5].
+\]
+%
+For $N=200$, $P=Q=40$, and $K=1000$, the dominant inner loop performs roughly $K \cdot m \approx 2\times10^7$ scalar $t$-tests, each over $\sim 80$ samples. The total floating-point work is modest ($\sim 10^9$ operations) but the implementation routes all of it through the Python interpreter.
+
+\subsection{Symmetry and the upper triangle}
+
+Each \texttt{x[:,:,i]} represents an undirected graph and is therefore assumed symmetric. The algorithm only uses the strict upper triangle (off-diagonal, $j > i$), so any deviation from symmetry below the diagonal is silently ignored. There is no explicit check for symmetry on the input. A user-side check is advisable.
+
+%==================================================================
+\section{Notation}
+
+\begin{tabular}{ll}
+$N$ & number of nodes \\
+$m = N(N-1)/2$ & number of upper-triangular edges \\
+$P, Q$ & number of subjects in groups X and Y \\
+$K$ & number of permutations \\
+$\tau$ & primary $t$-statistic threshold \\
+$X \in \mathbb{R}^{m\times P}$ & per-edge edge-by-subject matrix for group X (\texttt{xmat}) \\
+$Y \in \mathbb{R}^{m\times Q}$ & per-edge edge-by-subject matrix for group Y (\texttt{ymat}) \\
+$D = [X \mid Y] \in \mathbb{R}^{m\times (P+Q)}$ & concatenated data \\
+$\mathbf{t} \in \mathbb{R}^m$ & vector of per-edge $t$-statistics \\
+$A \in \{0,1\}^{N\times N}$ & suprathreshold adjacency matrix \\
+$s_{\max}$ & observed maximum component size (in edges) \\
+$\nu_u, u=1{,}\ldots{,}K$ & null draws of the max component size
+\end{tabular}
+
+\bigskip
+We will use $c_{\textrm{py}}$ to denote the per-call overhead of a pure-Python function call (roughly $1$--$10\,\mu\mathrm{s}$ on CPython~3.12) and $c_{\textrm{flop}}$ to denote a single double-precision floating-point operation in BLAS ($\approx 0.1$--$1\,\mathrm{ns}$). The ratio $c_{\textrm{py}} / c_{\textrm{flop}} \approx 10^4$ is what makes scalar Python loops over many small operations the dominant cost in this code.
+
+%==================================================================
+\section{Phase 1: Setup}
+
+\subsection{Validation and shape extraction (lines 132--144)}
+
+\begin{lstlisting}[firstnumber=132]
+if tail not in ('both', 'left', 'right'):
+    raise BCTParamError('Tail must be both, left, right')
+
+ix, jx, nx = x.shape
+iy, jy, ny = y.shape
+
+if not ix == jx == iy == jy:
+    raise BCTParamError('Population matrices are of inconsistent size')
+else:
+    n = ix
+
+if paired and nx != ny:
+    raise BCTParamError('Population matrices must be an equal size')
+\end{lstlisting}
+
+\paragraph{Cost.} $\mathcal{O}(1)$. Variables: \texttt{nx} and \texttt{ny} are aliases for $P$ and $Q$; \texttt{n} is $N$.
+
+\subsection{Upper-triangular index extraction (lines 146--150)}
+
+\begin{lstlisting}[firstnumber=146]
+# only consider upper triangular edges
+ixes = np.where(np.triu(np.ones((n, n)), 1))
+
+# number of edges
+m = np.size(ixes, axis=1)
+\end{lstlisting}
+
+This builds an $N\times N$ all-ones matrix, zeros out the lower triangle and the diagonal, and asks NumPy for the indices of the non-zero entries. \texttt{ixes} is a 2-tuple \texttt{(rows, cols)} each of length $m$, listing every off-diagonal upper-triangular edge in row-major order.
+
+\paragraph{Cost.} $\mathcal{O}(N^2)$ allocation and scan, executed once. Memory: a single $N\times N$ \texttt{float64} buffer ($\sim N^2 \cdot 8$ bytes). Wasteful but irrelevant in practice.
+
+\subsection{Vectorization of the connectivity stack (lines 152--159)}
+
+\begin{lstlisting}[firstnumber=152]
+# vectorize connectivity matrices for speed
+xmat, ymat = np.zeros((m, nx)), np.zeros((m, ny))
+
+for i in range(nx):
+    xmat[:, i] = x[:, :, i][ixes].squeeze()
+for i in range(ny):
+    ymat[:, i] = y[:, :, i][ixes].squeeze()
+del x, y
+\end{lstlisting}
+
+For each subject $i$, the slice \texttt{x[:,:,i]} (an $N\times N$ matrix) is fancy-indexed by \texttt{ixes} to yield the $m$-vector of upper-triangular entries; this becomes column $i$ of \texttt{xmat}. After the loop, $X = \texttt{xmat}$ has shape $(m, P)$ and $Y = \texttt{ymat}$ has shape $(m, Q)$. The original 3-D arrays are released.
+
+\paragraph{Cost.} $\mathcal{O}\bigl(m \cdot (P+Q)\bigr)$ memory traffic, in $P+Q$ NumPy fancy-indexing operations. Even for $N=500$, $P+Q=200$ this is $\sim 10^7$ memory writes --- well under one second. Not a bottleneck.
+
+%==================================================================
+\section{Phase 2: Observed $t$-statistics}
+
+\subsection{Two-sample $t$-test (lines 103--116)}
+
+\begin{lstlisting}[firstnumber=103]
+def ttest2_stat_only(x, y, tail):
+    t = np.mean(x) - np.mean(y)
+    n1, n2 = len(x), len(y)
+    s = np.sqrt(((n1 - 1) * np.var(x, ddof=1) + (n2 - 1)
+                 * np.var(y, ddof=1)) / (n1 + n2 - 2))
+    denom = s * np.sqrt(1 / n1 + 1 / n2)
+    if denom == 0:
+        return 0
+    if tail == 'both':
+        return np.abs(t / denom)
+    if tail == 'left':
+        return -t / denom
+    else:
+        return t / denom
+\end{lstlisting}
+
+This is the classical pooled-variance two-sample $t$-statistic
+%
+\begin{equation}
+T \;=\; \frac{\bar x - \bar y}{s_p\,\sqrt{\tfrac{1}{n_1} + \tfrac{1}{n_2}}}, \qquad s_p^2 \;=\; \frac{(n_1-1)\,\hat\sigma_x^2 + (n_2-1)\,\hat\sigma_y^2}{n_1+n_2-2},
+\label{eq:tstat}
+\end{equation}
+%
+with the absolute value taken when \texttt{tail='both'}.
+
+\paragraph{Cost per call.} The arithmetic is $\mathcal{O}(P+Q)$, but every line is a NumPy call: \texttt{np.mean}, two \texttt{np.var}, two \texttt{np.sqrt}, etc. Each NumPy call on a small array carries fixed overhead $c_{\textrm{py}}$ measured in microseconds. The actual cost is thus dominated by Python overhead, not arithmetic.
+
+\subsection{Paired $t$-test (lines 118--130)}
+
+\begin{lstlisting}[firstnumber=118]
+def ttest_paired_stat_only(A, B, tail):
+    n = len(A - B)
+    df = n - 1
+    sample_ss = np.sum((A - B)**2) - np.sum(A - B)**2 / n
+    unbiased_std = np.sqrt(sample_ss / (n - 1))
+    z = np.mean(A - B) / unbiased_std
+    t = z * np.sqrt(n)
+    if tail == 'both':
+        return np.abs(t)
+    ...
+\end{lstlisting}
+
+The standard paired $t$-statistic on $D_i = A_i - B_i$:
+%
+\begin{equation}
+T \;=\; \frac{\bar D}{\hat\sigma_D / \sqrt{n}}, \qquad \hat\sigma_D^2 \;=\; \frac{1}{n-1}\sum_i (D_i - \bar D)^2.
+\end{equation}
+%
+The line \texttt{n = len(A - B)} is functionally equivalent to \texttt{n = len(A)} (the subtraction does not change array length); it incurs an unnecessary $\mathcal{O}(n)$ allocation but is harmless. The variable \texttt{df} is computed and never used.
+
+\subsection{Per-edge loop (lines 161--167)}
+
+\begin{lstlisting}[firstnumber=161]
+# perform t-test at each edge
+t_stat = np.zeros((m,))
+for i in range(m):
+    if paired:
+        t_stat[i] = ttest_paired_stat_only(xmat[i, :], ymat[i, :], tail)
+    else:
+        t_stat[i] = ttest2_stat_only(xmat[i, :], ymat[i, :], tail)
+\end{lstlisting}
+
+This is the first true bottleneck. The loop performs $m$ Python-level function calls, each invoking five to ten further NumPy reductions over a tiny array of length $P+Q \le 200$.
+
+\paragraph{Cost.} Floating-point work: $\mathcal{O}\bigl(m\,(P+Q)\bigr)$. Wall time: dominated by Python and NumPy dispatch overhead, $\sim m \cdot 10\,c_{\textrm{py}}$. For $m = 2\times10^4$ this is roughly $0.2$--$2\,\mathrm{s}$, corresponding to less than one percent of theoretical hardware utilisation. Vectorising this single loop is the easiest large win in the entire algorithm.
+
+%==================================================================
+\section{Phase 3: Threshold and connected components on the observed data}
+
+\subsection{Threshold and adjacency reconstruction (lines 169--179)}
+
+\begin{lstlisting}[firstnumber=169]
+# threshold
+ind_t, = np.where(t_stat > thresh)
+
+if len(ind_t) == 0:
+    raise BCTParamError("Unsuitable threshold")
+
+# suprathreshold adjacency matrix
+adj = np.zeros((n, n))
+adj[(ixes[0][ind_t], ixes[1][ind_t])] = 1
+adj = adj + adj.T
+\end{lstlisting}
+
+\texttt{ind\_t} is the index set of suprathreshold edges (relative to the upper-triangular ordering). Lines 176--179 build the corresponding $N\times N$ adjacency matrix and symmetrize it.
+
+\paragraph{Cost.} $\mathcal{O}(m + N^2)$. Negligible.
+
+\subsection{The connected-components routine (\texttt{get\_components} in \texttt{algorithms/clustering.py})}
+
+\texttt{nbs.py} delegates component finding to \texttt{bct.algorithms.get\_components}. A reduced view of that function is:
+%
+\begin{lstlisting}
+def get_components(A, no_depend=False):
+    if not np.all(A == A.T):
+        raise BCTParamError(...)
+    A = binarize(A, copy=True)
+    n = len(A)
+    np.fill_diagonal(A, 1)
+    edge_map = [{u, v} for u in range(n) for v in range(n) if A[u, v] == 1]
+    union_sets = []
+    for item in edge_map:
+        temp = []
+        for s in union_sets:
+            if not s.isdisjoint(item):
+                item = s.union(item)
+            else:
+                temp.append(s)
+        temp.append(item)
+        union_sets = temp
+    comps = np.array([i+1 for v in range(n) for i in
+                      range(len(union_sets)) if v in union_sets[i]])
+    comp_sizes = np.array([len(s) for s in union_sets])
+    return comps, comp_sizes
+\end{lstlisting}
+
+This is a Python-level union-find over Python sets, prefaced by an $\mathcal{O}(N^2)$ Python comprehension to build \texttt{edge\_map}. Notable cost characteristics:
+
+\begin{itemize}[leftmargin=2.0em]
+\item The \texttt{edge\_map} list-comprehension does $N^2$ Python iterations and creates one Python set object per non-zero entry. For $N=500$ that is $2.5\times10^5$ iterations and a comparable number of object allocations \emph{regardless of graph density}.
+\item The union loop is $\mathcal{O}(E \cdot C)$, where $E$ is the number of edges and $C$ is the running number of components, with each step performing Python-set \texttt{isdisjoint} / \texttt{union} operations.
+\item The final \texttt{comps} comprehension is $\mathcal{O}(N \cdot C)$ Python iterations with set membership tests.
+\end{itemize}
+
+\paragraph{Cost in context.} \texttt{get\_components} is called once for the observed data and $K$ additional times inside the permutation loop. For $N=200$ with a moderately dense suprathreshold graph, a single call typically costs tens of milliseconds. Multiplied by $K=1000$ this often accounts for tens of seconds to a few minutes of wall time --- comparable to or larger than the per-edge $t$-test loop. \emph{The component routine is the second major bottleneck and cannot be ignored.}
+
+\subsection{Component sizes in edges (lines 183--202)}
+
+\begin{lstlisting}[firstnumber=183]
+ind_sz, = np.where(sz > 1)
+ind_sz += 1
+nr_components = np.size(ind_sz)
+sz_links = np.zeros((nr_components,))
+for i in range(nr_components):
+    nodes, = np.where(ind_sz[i] == a)
+    sz_links[i] = np.sum(adj[np.ix_(nodes, nodes)]) / 2
+    adj[np.ix_(nodes, nodes)] *= (i + 2)
+
+# subtract 1 to delete any edges not comprising a component
+adj[np.where(adj)] -= 1
+
+if np.size(sz_links):
+    max_sz = np.max(sz_links)
+else:
+    raise BCTParamError('True matrix is degenerate')
+\end{lstlisting}
+
+For each component (with more than one node), the number of internal edges is computed as half the sum of the component's induced sub-adjacency. The same loop also relabels \texttt{adj} with component IDs so the returned matrix carries component identity (subtracting~1 at the end to clear non-component edges).
+
+\paragraph{Cost.} $\mathcal{O}(C \cdot N^2)$, where $C$ is the number of components retained. $C$ is small in practice (units to tens), so this block is cheap.
+
+%==================================================================
+\section{Phase 4: Permutation null distribution (lines 208--257)}
+
+\subsection{The exchangeability argument}
+
+Under the null hypothesis that the per-edge connectivity values are drawn from a common distribution shared by both groups, the assignment of subjects to ``X'' versus ``Y'' is exchangeable. Permutation testing rebuilds an empirical null by repeatedly relabelling subjects, recomputing the test statistic, and recording its distribution. NBS records, on each permutation, only the \emph{maximum} suprathreshold component size --- this is what produces family-wise control of the error rate at the component level.
+
+For paired data, the natural exchangeability is sign-flipping the per-pair difference: under $H_0$, $X_i - Y_i$ has the same distribution as $-(X_i - Y_i)$.
+
+\subsection{Permutation generation (lines 210--216)}
+
+\begin{lstlisting}[firstnumber=210]
+for u in range(k):
+    # randomize
+    if paired:
+        indperm = np.sign(0.5 - rng.rand(1, nx))
+        d = np.hstack((xmat, ymat)) * np.hstack((indperm, indperm))
+    else:
+        d = np.hstack((xmat, ymat))[:, rng.permutation(nx + ny)]
+\end{lstlisting}
+
+\paragraph{Unpaired case.} \texttt{np.hstack((xmat, ymat))} forms $D = [X\,|\,Y]$ of shape $(m, P+Q)$. \texttt{rng.permutation(nx+ny)} returns a random permutation $\pi$ of the column indices $\{0,\ldots,P+Q-1\}$. Reindexing reorders the subjects: the first $P$ columns of the permuted $D$ are the new ``group X'' and the last $Q$ are the new ``group Y''.
+
+\paragraph{Paired case.} \texttt{np.sign(0.5 - rng.rand(1, nx))} draws independent $\pm 1$ Rademacher signs, one per subject pair (\texttt{rand} samples uniform on $[0,1)$; comparing to $0.5$ gives roughly equiprobable signs). The sign vector \texttt{indperm} is then tiled across both halves so that pair $i$ has its $X_i$ and $Y_i$ flipped together; \texttt{ttest\_paired\_stat\_only} then sees $\pm(X_i - Y_i)$, which is exactly the standard sign-flip permutation for paired data.
+
+\paragraph{Cost.} The \texttt{hstack} allocates a new $(m, P+Q)$ array \emph{on every permutation}. The fancy indexing \texttt{[:, perm]} copies it a second time. Memory traffic per permutation: $\mathcal{O}\bigl(m\,(P+Q)\bigr)$. For $m=2\times 10^4$, $P+Q=80$, $K=1000$: about $\sim 12\,$GB of cumulative memory traffic for these two operations alone.
+
+\subsection{Permuted $t$-tests (lines 218--224)}
+
+\begin{lstlisting}[firstnumber=218]
+t_stat_perm = np.zeros((m,))
+for i in range(m):
+    if paired:
+        t_stat_perm[i] = ttest_paired_stat_only(d[i, :nx], d[i, -nx:], tail)
+    else:
+        t_stat_perm[i] = ttest2_stat_only(d[i, :nx], d[i, -ny:], tail)
+\end{lstlisting}
+
+This is the same Python loop as in Phase~2, now executed inside an outer loop of length $K$.
+
+\paragraph{Cost.} $\mathcal{O}(K \cdot m \cdot (P+Q))$ FLOPs; wall time dominated by $\sim K\,m\,c_{\textrm{py}}$ Python overhead. \textbf{This is the single dominant runtime cost in the entire algorithm.} For $K=1000$, $m=2\times 10^4$, this is on the order of $10^4$--$10^5$\,seconds at scalar Python rates, in practice mitigated only because each \texttt{np.mean}/\texttt{np.var} call still benefits from C-level inner-loop arithmetic.
+
+\subsection{Threshold, components, and max size per permutation (lines 226--245)}
+
+\begin{lstlisting}[firstnumber=226]
+ind_t, = np.where(t_stat_perm > thresh)
+
+adj_perm = np.zeros((n, n))
+adj_perm[(ixes[0][ind_t], ixes[1][ind_t])] = 1
+adj_perm = adj_perm + adj_perm.T
+
+a, sz = get_components(adj_perm)
+
+ind_sz, = np.where(sz > 1)
+ind_sz += 1
+nr_components_perm = np.size(ind_sz)
+sz_links_perm = np.zeros((nr_components_perm))
+for i in range(nr_components_perm):
+    nodes, = np.where(ind_sz[i] == a)
+    sz_links_perm[i] = np.sum(adj_perm[np.ix_(nodes, nodes)]) / 2
+
+if np.size(sz_links_perm):
+    null[u] = np.max(sz_links_perm)
+else:
+    null[u] = 0
+\end{lstlisting}
+
+This block mirrors Phase~3 exactly, except that it stores only the maximum component size $\nu_u = \texttt{null[u]}$. \texttt{get\_components} dominates the per-permutation cost outside the $t$-test loop.
+
+\subsection{Per-iteration progress reporting (lines 247--257)}
+
+The branch updates a hit counter against the observed maximum and prints progress. Cost: negligible in single-process mode; in the multiprocessing variant (\texttt{nbs\_parallel.py}) the equivalent counter is computed in worker processes and discarded, since each worker receives a copy of the integer rather than a shared state.
+
+%==================================================================
+\section{Phase 5: $p$-values (lines 259--263)}
+
+\begin{lstlisting}[firstnumber=259]
+pvals = np.zeros((nr_components,))
+print("nr_components: ", nr_components)
+# calculate p-vals
+for i in range(nr_components):
+    pvals[i] = np.size(np.where(null >= sz_links[i])) / k
+\end{lstlisting}
+
+For each observed component $c$ with size $s_c$, the corrected $p$-value is
+%
+\begin{equation}
+\hat p_c \;=\; \frac{1}{K}\sum_{u=1}^K \mathbf{1}\{\nu_u \ge s_c\}.
+\label{eq:pvalue}
+\end{equation}
+%
+This loop is $\mathcal{O}(C \cdot K)$ where $C$ is the (small) number of observed components. Cost is trivial.
+
+%==================================================================
+\section{Total cost summary}
+
+Let $T_{cc}(N, \rho)$ denote the cost of \texttt{get\_components} on an $N$-node graph with edge density $\rho$. With the bctpy implementation, $T_{cc} \approx c_{\textrm{py}} \cdot \bigl(N^2 + \rho N^2 \cdot C\bigr)$.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Phase & Asymptotic FLOPs & Wall-time order in practice \\
+\midrule
+Setup (validation, ixes, vectorize) & $\mathcal{O}(N^2 + m(P{+}Q))$ & $< 0.1$\,s \\
+Observed $t$-tests & $\mathcal{O}(m(P{+}Q))$ & $\sim m\, c_{\textrm{py}}$, $0.1$--$2$\,s \\
+Observed threshold + components & $\mathcal{O}(N^2) + T_{cc}$ & $0.01$--$0.5$\,s \\
+Permutation $t$-tests & $\mathcal{O}(K m (P{+}Q))$ & $\sim K m\, c_{\textrm{py}}$, minutes--hours \\
+Permutation components & $K \cdot T_{cc}$ & seconds--minutes \\
+$p$-values & $\mathcal{O}(C K)$ & $< 1$\,ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Bottlenecks identified.}
+\begin{enumerate}[leftmargin=2.0em]
+\item The $K m$ scalar Python $t$-test calls in the permutation loop. The arithmetic is trivial; Python and NumPy dispatch overhead is the cost.
+\item The $K$ calls to \texttt{get\_components} on small graphs, each going through a quadratic Python comprehension and a Python-set union-find.
+\end{enumerate}
+
+A successful re-implementation must eliminate or amortize \emph{both}. Optimising only the $t$-tests would expose \texttt{get\_components} as the new bottleneck; optimising only the components would still leave a multi-minute permutation loop.
+
+%==================================================================
+\section{The multiprocessing variant (\texttt{nbs\_parallel.py})}
+
+\texttt{bct/nbs\_parallel.py} dispatches the $K$ permutations across CPU workers using \texttt{multiprocessing.Pool}. Two operational notes:
+
+\begin{enumerate}[leftmargin=2.0em]
+\item \emph{Shared state is not actually shared.} The \texttt{null}, \texttt{max\_sz}, and \texttt{hit} variables are passed by value to each worker; each worker mutates a private copy. The reduction at the end of \texttt{nbs\_bct} reconstructs \texttt{null\_dist} by stacking column-wise maxima across worker outputs.
+\item \emph{Argument pickling is costly.} The argument tuple containing \texttt{xmat} and \texttt{ymat} is constructed $K$ times in \texttt{perm\_args}; \texttt{Pool.map} pickles each chunk to its worker. For $m\sim 10^4$ this dominates worker startup but is amortised across the chunk.
+\end{enumerate}
+
+The wall-time speedup from this version is roughly the number of workers, capped by the per-worker \texttt{get\_components} cost. It does not change the algorithmic story.
+
+%==================================================================
+\begin{thebibliography}{1}
+\bibitem{Zalesky2010} A. Zalesky, A. Fornito, and E. T. Bullmore, ``Network-based statistic: identifying differences in brain networks,'' \emph{NeuroImage}, vol.~53, no.~4, pp.~1197--1207, 2010.
+\end{thebibliography}
+
+\end{document}

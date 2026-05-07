@@ -1,0 +1,430 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\usepackage[ruled,vlined]{algorithm2e}
+
+\definecolor{kw}{HTML}{0066AA}
+\definecolor{cm}{HTML}{888888}
+\definecolor{st}{HTML}{AA5500}
+\definecolor{bg}{HTML}{F7F7F7}
+
+\lstdefinestyle{py}{
+  language=Python,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cm}\itshape,
+  stringstyle=\color{st},
+  backgroundcolor=\color{bg},
+  showstringspaces=false,
+  breaklines=true,
+  numbers=none,
+  frame=single,
+  framerule=0pt,
+  xleftmargin=8pt
+}
+\lstset{style=py}
+
+\title{A \texttt{torch}-based Replacement for \texttt{bctpy.nbs\_bct}:\\
+Design and Verification Plan}
+\author{Notes for the rchimera plots project}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We describe a drop-in replacement for \texttt{bct.nbs\_bct} that uses PyTorch to vectorise the per-edge $t$-statistics and to batch the $K$ permutation $t$-tests into a constant-depth sequence of dense matrix multiplications. We replace the \texttt{bctpy} component-finding routine with \texttt{scipy.sparse.csgraph.connected\_components}, which removes the second bottleneck. We then specify a verification plan with numerical, statistical, structural, and performance tests sufficient to retire the reference implementation in a research pipeline.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%==================================================================
+\section{Strategy at a glance}
+
+The companion document identifies two bottlenecks in \texttt{bct/nbs.py}: the $K m$ scalar Python $t$-tests, and the $K{+}1$ calls to \texttt{get\_components}. The plan addresses each:
+
+\begin{enumerate}[leftmargin=2.0em]
+\item \textbf{All $K m$ $t$-tests in $\mathcal{O}(1)$ host calls.} Reformulate the pooled-variance two-sample $t$-statistic so that a single batch of permutations becomes four matrix multiplications between data tensors and a permutation-mask tensor. The computation runs on CPU torch or, ideally, on GPU.
+
+\item \textbf{Replace component-finding with a C-level routine.} Use \texttt{scipy.sparse.csgraph.connected\_components}, which runs union-find on a CSR sparse representation. For the typical neuroimaging $N$ this is between $10^2$ and $10^4$ times faster than the \texttt{bctpy} implementation.
+
+\item \textbf{Keep the existing public API.} The new module \texttt{bct/nbs\_torch.py} exposes a function with the same signature as \texttt{nbs\_bct} (plus an optional \texttt{device} argument). The reference implementation is \emph{not} modified, so the two can be compared on identical inputs.
+\end{enumerate}
+
+%==================================================================
+\section{Vectorising the observed $t$-statistic}
+
+The pooled-variance statistic from Equation~\eqref{eq:tstat} of the companion document is, for fixed group sizes $P$ and $Q$, a smooth function of three sufficient statistics on each group: the sum, the sum-of-squares, and the count. With $X \in \mathbb{R}^{m\times P}$ and $Y \in \mathbb{R}^{m\times Q}$ as torch tensors, the per-edge $t$-vector becomes
+
+\begin{lstlisting}
+mx = X.mean(dim=1)                  # (m,)
+my = Y.mean(dim=1)                  # (m,)
+vx = X.var(dim=1, unbiased=True)    # (m,)
+vy = Y.var(dim=1, unbiased=True)    # (m,)
+sp = torch.sqrt(((P-1)*vx + (Q-1)*vy) / (P+Q-2))
+denom = sp * (1.0/P + 1.0/Q)**0.5
+t_obs = (mx - my) / denom           # (m,)
+\end{lstlisting}
+
+This is one batched call per reduction --- $m$ scalar Python calls collapse to $\mathcal{O}(1)$. On a single CPU core this is two to three orders of magnitude faster than the reference loop; on GPU it is essentially free.
+
+\paragraph{Tail handling.} Apply the same conditional as in \texttt{ttest2\_stat\_only}: \texttt{torch.abs(t\_obs)} for two-sided, $-\texttt{t\_obs}$ for left-tailed, $\texttt{t\_obs}$ for right-tailed.
+
+\paragraph{Degenerate edges.} If an edge has zero variance in both groups, \texttt{denom} is zero and the reference returns~0. We replicate that behaviour with \texttt{torch.where(denom == 0, torch.zeros\_like(t\_obs), t\_obs / denom)}. A bitwise check in fp32 is brittle; using the floating-point predicate \texttt{denom <= 0} is sufficient and, by construction, $s_p \ge 0$.
+
+%==================================================================
+\section{Batching the $K$ permutations into matrix multiplications}
+
+\subsection{Key observation}
+
+Let $D = [X \,|\, Y] \in \mathbb{R}^{m \times (P+Q)}$ be the concatenated data and $D^{(2)}_{ij} = D_{ij}^2$ its elementwise square. A permutation of subject labels --- in the unpaired case --- is fully determined by a binary mask
+%
+\[
+\mathbf{w}_X^{(u)} \in \{0,1\}^{P+Q}, \qquad \sum_j w_{X,j}^{(u)} = P,
+\]
+%
+indicating which $P$ columns of $D$ are assigned to ``group X'' under permutation $u$. The complementary mask is $\mathbf{w}_Y^{(u)} = \mathbf{1} - \mathbf{w}_X^{(u)}$ and selects the remaining $Q$ columns as ``group Y.''
+
+Stacking the $K$ masks into matrices $W_X, W_Y \in \{0,1\}^{K \times (P+Q)}$, the per-permutation group sums and sums-of-squares are
+%
+\begin{align}
+S_X &= D \, W_X^{\top} \in \mathbb{R}^{m\times K},\\
+S_Y &= D \, W_Y^{\top} \in \mathbb{R}^{m\times K},\\
+Q_X &= D^{(2)}\, W_X^{\top} \in \mathbb{R}^{m\times K},\\
+Q_Y &= D^{(2)}\, W_Y^{\top} \in \mathbb{R}^{m\times K}.
+\end{align}
+%
+The per-edge, per-permutation pooled $t$-statistic follows directly:
+%
+\begin{align}
+\bar X^{(u)}_e &= S_{X,e,u}/P, \qquad \bar Y^{(u)}_e = S_{Y,e,u}/Q,\\
+\hat\sigma^{2,(u)}_{X,e} &= \frac{Q_{X,e,u} - P\,(\bar X^{(u)}_e)^2}{P-1},\\
+\hat\sigma^{2,(u)}_{Y,e} &= \frac{Q_{Y,e,u} - Q\,(\bar Y^{(u)}_e)^2}{Q-1},\\
+T^{(u)}_e &= \frac{\bar X^{(u)}_e - \bar Y^{(u)}_e}{\sqrt{\frac{(P-1)\hat\sigma^{2,(u)}_{X,e} + (Q-1)\hat\sigma^{2,(u)}_{Y,e}}{P+Q-2}}\;\sqrt{\tfrac1P + \tfrac1Q}}.
+\end{align}
+%
+The result $T \in \mathbb{R}^{m\times K}$ contains all $mK$ permutation $t$-statistics, computed in four GEMMs and a handful of pointwise operations.
+
+\subsection{Memory and runtime}
+
+The dominant tensor allocations are $D, D^{(2)} \in \mathbb{R}^{m\times(P+Q)}$ and the four $(m\times K)$ intermediates. For $m = 2\times10^4$, $P+Q=80$, $K=10^3$, fp32:
+%
+\[
+\mathrm{Mem}(D) \approx 6.4\,\mathrm{MB}, \qquad \mathrm{Mem}(\text{intermediates}) \approx 4 \cdot 80\,\mathrm{MB} = 320\,\mathrm{MB}.
+\]
+%
+This fits comfortably in the memory of a current GPU. For larger $m$ or $K$ the computation can be tiled along the $K$ axis at no algorithmic penalty (each permutation is independent).
+
+Runtime: each GEMM is $\mathcal{O}(m \cdot (P+Q) \cdot K)$ FLOPs; for the figures above, $\sim 1.6$\,GFLOP per matmul, of which a modern GPU executes on the order of $10^{13}$ per second. Wall-time budget for the entire $K$-permutation $t$-statistic computation is in the tens of milliseconds.
+
+\subsection{Generating the permutation masks}
+
+Three options, all valid:
+
+\begin{enumerate}[leftmargin=2.0em]
+\item \emph{Argsort over Gaussian noise.} Draw $G \sim \mathcal{N}(0, I)$ of shape $(K, P+Q)$, sort each row, and use the first $P$ argsort indices to set $W_X$. This is one line of torch and runs on GPU.
+\item \emph{Bernoulli + balance.} Equivalent to the above but easier when $P=Q$.
+\item \emph{Pre-compute on CPU NumPy} and copy to device. Identical statistics, slightly slower for large $K$.
+\end{enumerate}
+
+\paragraph{Reproducibility.} The reference implementation seeds NumPy's RNG via \texttt{get\_rng(seed)}. The torch version should accept the same \texttt{seed} argument, instantiate a \texttt{torch.Generator} on the chosen device, and use it for mask generation. Bit-identical reproducibility against the reference cannot be guaranteed (different RNG streams), but \emph{run-to-run reproducibility} of the torch version itself can.
+
+\subsection{Paired permutations}
+
+For paired data the masks become $\mathbf{s}^{(u)} \in \{-1, +1\}^P$, applied identically to the $i$-th column of $X$ and the $i$-th column of $Y$. Letting $E = X - Y \in \mathbb{R}^{m\times P}$ and $S \in \{-1, +1\}^{K\times P}$ be the sign matrix,
+%
+\[
+E^{(u)} = E \odot \mathbf{s}^{(u)\top}, \qquad \bar E^{(u)} = \frac{1}{P} E\,\mathbf{s}^{(u)},
+\]
+%
+and the per-edge paired $t$ is
+%
+\[
+T^{(u)}_e = \frac{\bar E^{(u)}_e \sqrt{P}}{\hat\sigma^{(u)}_{E,e}},
+\]
+%
+with the sample standard deviation computed from $E^{(u)}$ in the same matmul style. A single matmul $E S^\top$ produces all $mK$ paired-difference sums.
+
+%==================================================================
+\section{Replacing the connected-components routine}
+
+The reference \texttt{get\_components} is dominated by an $\mathcal{O}(N^2)$ Python comprehension and a Python-set union-find. The drop-in replacement is
+
+\begin{lstlisting}
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+
+def fast_get_components(adj):
+    csr = csr_matrix(adj)
+    n_comp, labels = connected_components(csr, directed=False)
+    sizes = np.bincount(labels)
+    return labels + 1, sizes        # +1 to match bctpy's 1-based labels
+\end{lstlisting}
+
+\texttt{scipy.sparse.csgraph.connected\_components} runs union-find at C level over a CSR sparse matrix and is the standard reference for component finding in the SciPy ecosystem. Empirically, on $N = 200$ binary adjacency matrices it executes in tens of microseconds.
+
+\paragraph{API equivalence.} The reference \texttt{get\_components} returns 1-based component labels. The replacement preserves this convention by adding~1. \emph{Identity of component IDs is not preserved} --- but the original docstring already disclaims that, and the algorithm only ever uses component sizes and component memberships, both of which are invariant under relabelling.
+
+\paragraph{Where to call it.} On the observed graph, once. Inside the permutation loop, $K$ times --- but now the loop body is a $\sim 50\,\mu\mathrm{s}$ scipy call rather than a $\sim 50\,\mathrm{ms}$ Python loop. We do \emph{not} attempt to vectorise CC across permutations on GPU; the host-side scipy version is fast enough that engineering a torch-native solution is not worth the complexity.
+
+%==================================================================
+\section{Per-permutation component-size in edges}
+
+Once \texttt{labels} is known, the size in edges of each component is
+%
+\[
+\bigl|E_c\bigr| \;=\; \tfrac{1}{2}\,\mathbf{1}_{c}^{\top} A\, \mathbf{1}_{c}
+\]
+%
+where $\mathbf{1}_c$ is the indicator vector of component $c$'s nodes. With $C$ components and an $N\times N$ adjacency, this is $\mathcal{O}(C N^2)$ per permutation. We retain the reference's per-component loop because $C$ is invariably small.
+
+%==================================================================
+\section{Algorithm summary}
+
+\begin{algorithm}[H]
+\SetAlgoLined
+\KwIn{$x \in \mathbb{R}^{N\times N\times P}$, $y \in \mathbb{R}^{N\times N\times Q}$, threshold $\tau$, $K$, tail, paired flag, seed, device.}
+\KwOut{component $p$-values, labelled adjacency, null distribution.}
+\BlankLine
+Validate shapes; compute upper-triangular index pair \texttt{ixes} and $m$\;
+Materialise \texttt{xmat}, \texttt{ymat} on the chosen torch device\;
+\BlankLine
+\textbf{Observed:}\;
+Compute $\mathbf{t}$ from \texttt{xmat}, \texttt{ymat} via vectorised pooled-variance formula\;
+Threshold and scatter to $A$ on host (CPU)\;
+$(\texttt{labels}, \texttt{sizes}) \gets \texttt{fast\_get\_components}(A)$\;
+Compute observed component edge sizes \texttt{sz\_links} and $s_{\max}$\;
+\BlankLine
+\textbf{Permutations:}\;
+Generate $W_X, W_Y \in \{0,1\}^{K\times(P+Q)}$ on device (or sign matrix for paired)\;
+Compute $T \in \mathbb{R}^{m\times K}$ via four GEMMs\;
+Move thresholded mask $T > \tau$ to host as bool\;
+\For{$u = 1, \ldots, K$}{
+  Build $A^{(u)}$ from upper-triangular indices and column $u$ of the mask\;
+  $(\texttt{labels}^{(u)}, \texttt{sizes}^{(u)}) \gets \texttt{fast\_get\_components}(A^{(u)})$\;
+  Compute $\nu_u = \max_c |E_c^{(u)}|$\;
+}
+\BlankLine
+\textbf{$p$-values:} $\hat p_c = \frac{1}{K}\sum_u \mathbf{1}\{\nu_u \ge s_c\}$\;
+\Return{$\hat p, A, \nu$}\;
+\caption{NBS with batched torch $t$-statistics.}
+\end{algorithm}
+
+%==================================================================
+\section{Expected runtime improvement}
+
+For a representative configuration --- $N=200$, $P=Q=40$, $K=10^3$, $\tau=3.0$, density of suprathreshold graph $\sim 1\%$ --- the budget shifts as follows:
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+Stage & Reference & Torch (CPU) & Torch (GPU) \\
+\midrule
+Vectorisation/prep                     & $<0.1$\,s   & $<0.1$\,s   & $<0.1$\,s \\
+Observed $t$-tests ($m$ edges)          & $\sim 1$\,s & $<10$\,ms   & $<1$\,ms  \\
+Observed components                     & $\sim 0.1$\,s & $<1$\,ms  & $<1$\,ms  \\
+Permutation $t$-tests ($Km$ scalars)    & $\sim 600$--$1800$\,s & $\sim 5$\,s & $<0.1$\,s \\
+Permutation components ($K\times$)      & $\sim 60$\,s & $\sim 0.3$\,s & $\sim 0.3$\,s \\
+$p$-values                              & $<1$\,ms    & $<1$\,ms    & $<1$\,ms  \\
+\midrule
+Wall-time (total)                       & 10--30 min & $\sim 5$--10\,s & $\sim 0.5$--1\,s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The numbers above are order-of-magnitude estimates, not benchmarks; the verification plan below produces real measurements.
+
+%==================================================================
+\section{Verification plan}
+
+The verification plan has four pillars: \emph{numerical agreement} on individual statistics, \emph{structural agreement} on graph topology, \emph{statistical agreement} on the null distribution, and \emph{performance characterisation}. Tests are listed in execution order.
+
+\subsection{Test data}
+
+We define three fixtures, fixed once:
+
+\begin{enumerate}[leftmargin=2.0em]
+\item \texttt{tiny}: $N=20$, $P=Q=10$, deterministic seed; no planted signal. Used to verify implementation correctness on a graph small enough for exhaustive checks.
+\item \texttt{synthetic\_planted}: $N=100$, $P=Q=30$, with a 6-node clique whose edges have group-X mean shifted by $+1\sigma$. Used to validate that the torch implementation recovers the planted component with similar $p$-value as the reference.
+\item \texttt{realistic}: $N=200$, $P=Q=40$, drawn from a Gaussian random-graph model fitted to a real connectivity sample (or a real sample if available). Used for performance benchmarking and for the null-distribution KS test.
+\end{enumerate}
+
+Both \texttt{xmat}/\texttt{ymat} and the per-subject 3-D arrays are stored as \texttt{float64} for the reference and tested in both \texttt{float64} and \texttt{float32} for torch.
+
+\subsection{T1 --- Numerical equivalence of per-edge $t$ on a single dataset}
+
+\paragraph{Goal.} The vectorised observed $t$-statistic equals the per-edge reference to within numerical precision.
+
+\paragraph{Procedure.}
+\begin{enumerate}[leftmargin=2.0em]
+\item Compute \texttt{t\_ref[i]} for all $i$ using \texttt{ttest2\_stat\_only(xmat[i], ymat[i], tail)}.
+\item Compute \texttt{t\_torch} using the vectorised formula on the same arrays cast to \texttt{torch.float64}.
+\item Assert \texttt{np.allclose(t\_ref, t\_torch.cpu().numpy(), rtol=1e-12, atol=1e-12)}.
+\item Repeat for \texttt{tail} $\in \{$\texttt{both}, \texttt{left}, \texttt{right}$\}$ and for paired vs.\ unpaired.
+\item Repeat in \texttt{float32}; relax tolerance to \texttt{rtol=1e-5}.
+\end{enumerate}
+
+\paragraph{Pass criterion.} All four tail$\times$paired combinations pass the assertion at the stated tolerance.
+
+\subsection{T2 --- Numerical equivalence of permuted $t$ across $K$ permutations}
+
+\paragraph{Goal.} The batched permuted $t$-statistic matrix equals what the reference would compute permutation-by-permutation.
+
+\paragraph{Procedure.}
+\begin{enumerate}[leftmargin=2.0em]
+\item Pre-compute $K=64$ permutations as a NumPy index matrix \texttt{perms} of shape $(K, P+Q)$.
+\item For each $u$, run \texttt{ttest2\_stat\_only} per edge on the reordered data; assemble \texttt{t\_ref\_K[:, u]}.
+\item Build $W_X$ from \texttt{perms} and run the four-GEMM batched computation; assemble \texttt{t\_torch\_K} of shape $(m, K)$.
+\item Assert \texttt{np.allclose} as in T1.
+\end{enumerate}
+
+\paragraph{Pass criterion.} Per-element max relative error $< 10^{-12}$ in fp64, $< 10^{-4}$ in fp32. The test fails informatively if a single edge has anomalous error: report the edge index, the offending permutation, and both $t$-values.
+
+\subsection{T3 --- Component-size equivalence on the observed graph}
+
+\paragraph{Goal.} For the observed thresholded adjacency, the multiset of component sizes (in nodes \emph{and} in edges) is identical between \texttt{get\_components} and \texttt{fast\_get\_components}.
+
+\paragraph{Procedure.}
+\begin{enumerate}[leftmargin=2.0em]
+\item Threshold \texttt{t\_obs} at the prescribed $\tau$ to build $A$.
+\item Compute \texttt{(a\_ref, sz\_ref)} via \texttt{get\_components}; \texttt{(a\_fast, sz\_fast)} via \texttt{fast\_get\_components}.
+\item Assert \texttt{sorted(sz\_ref.tolist()) == sorted(sz\_fast.tolist())}.
+\item For each component-size value $s$, assert that the number of nodes assigned to a component of size $s$ matches across the two routines (a histogram-style check that does not depend on label IDs).
+\item Compute component edge-sizes via the existing \texttt{sum(adj[ix\_(nodes,nodes)])/2} pattern in both. Assert equality of the sorted lists.
+\end{enumerate}
+
+\paragraph{Pass criterion.} Both sorted lists match exactly. (Component identifiers may differ.)
+
+\subsection{T4 --- Component-size equivalence on permuted graphs}
+
+\paragraph{Goal.} Same as T3, but on permutation graphs --- to guard against subtle differences in edge-mask construction or scatter pattern between the reference and torch implementations.
+
+\paragraph{Procedure.}
+\begin{enumerate}[leftmargin=2.0em]
+\item Use $K=64$ permutations from T2, with thresholded mask $M \in \{0,1\}^{m\times K}$.
+\item For each $u$, build $A^{(u)}$ on the reference path (from per-edge mask) and $A^{(u)}_{\textrm{torch}}$ from the torch mask, then assert $A^{(u)} = A^{(u)}_{\textrm{torch}}$ exactly.
+\item Run \texttt{fast\_get\_components} on each and store the sorted edge-sizes.
+\item Compare against the reference \texttt{get\_components} edge-sizes for $u \in \{1, \ldots, 8\}$ (a subset, for runtime).
+\end{enumerate}
+
+\paragraph{Pass criterion.} Adjacency matrices match bitwise; sorted edge-size lists match exactly on the eight reference-comparable permutations.
+
+\subsection{T5 --- Statistical equivalence of the null distribution}
+
+\paragraph{Goal.} The empirical null produced by the torch implementation comes from the same distribution as the reference.
+
+\paragraph{Procedure.}
+\begin{enumerate}[leftmargin=2.0em]
+\item Run both implementations on the \texttt{realistic} fixture with $K = 200$, identical \texttt{thresh} and \texttt{tail}. Different RNG seeds are acceptable (and necessary, since RNG streams differ).
+\item Apply a two-sample Kolmogorov--Smirnov test to the two \texttt{null} arrays.
+\end{enumerate}
+
+\paragraph{Pass criterion.} KS $p$-value $> 0.01$. Repeat with three different seed pairs and require at least two of three to pass --- with $K=200$ the test has appreciable variance and a single pair occasionally crosses the threshold by chance under $H_0$.
+
+\subsection{T6 --- End-to-end $p$-value agreement on the planted-component fixture}
+
+\paragraph{Goal.} The torch implementation correctly identifies the planted component and assigns it a $p$-value compatible with the reference.
+
+\paragraph{Procedure.}
+\begin{enumerate}[leftmargin=2.0em]
+\item Run both implementations on \texttt{synthetic\_planted} with $K=1000$, $\tau$ chosen so the planted clique is a single component above threshold roughly half the time.
+\item Identify the component overlapping the planted clique (Jaccard $> 0.8$ with the planted node set).
+\item Compare $p$-values $\hat p_{\textrm{ref}}, \hat p_{\textrm{torch}}$.
+\end{enumerate}
+
+\paragraph{Pass criterion.} $|\hat p_{\textrm{ref}} - \hat p_{\textrm{torch}}| \le 3 / \sqrt{K}$, i.e.\ within three Monte-Carlo standard deviations of the worst case.
+
+\subsection{T7 --- Edge cases}
+
+Each of the following scenarios must complete without raising and produce a defensible result:
+
+\begin{itemize}[leftmargin=2.0em]
+\item \emph{Constant edge.} An edge whose value is identical for every subject (zero variance) yields $T = 0$ in the reference; verify the torch implementation matches.
+\item \emph{Threshold below the minimum $t$.} All edges suprathreshold $\Rightarrow$ a single near-complete component. Both implementations should return one component spanning $\sim N$ nodes.
+\item \emph{Threshold above the maximum $t$.} No suprathreshold edges. The reference raises \texttt{BCTParamError}; the torch implementation must raise the same exception.
+\item \emph{Paired with $P=2$.} A degenerate paired test with two pairs and only four sign-flip permutations. Verify that the null collapses to four discrete values.
+\item \emph{Asymmetric input.} Inject a tiny asymmetry into one subject's matrix; both implementations should silently use only the upper triangle.
+\end{itemize}
+
+\paragraph{Pass criterion.} All scenarios behave as specified above.
+
+\subsection{T8 --- Performance benchmark}
+
+\paragraph{Goal.} Quantify wall-time speedup on representative inputs.
+
+\paragraph{Procedure.}
+\begin{enumerate}[leftmargin=2.0em]
+\item For each of the three fixtures, run \texttt{nbs\_bct} (reference, single process) and the torch version (CPU and, if available, GPU). Record wall time and per-stage time:
+\begin{itemize}
+\item observed $t$-test
+\item observed components
+\item permutation $t$-tests (total)
+\item permutation components (total)
+\item $p$-value computation
+\end{itemize}
+\item Repeat each run three times; report median.
+\item Verify the speedup matches the order-of-magnitude budget in the table above. Investigate any stage that is more than $2\times$ slower than projected.
+\end{enumerate}
+
+\paragraph{Pass criterion.} Total wall-time speedup on \texttt{realistic} is at least $50\times$ on CPU and at least $200\times$ on GPU. Failures here are diagnostic, not blocking --- but should be documented.
+
+\subsection{T9 --- Reproducibility}
+
+\paragraph{Goal.} The torch implementation is run-to-run reproducible given a fixed seed.
+
+\paragraph{Procedure.} Run the torch implementation twice with the same \texttt{seed} on \texttt{realistic}; assert that \texttt{null} arrays are identical.
+
+\paragraph{Pass criterion.} Bit-identical \texttt{null} arrays. (Note: the reference is also reproducible; cross-implementation reproducibility is \emph{not} expected because RNG streams differ.)
+
+\subsection{T10 --- Memory profile}
+
+\paragraph{Goal.} Confirm peak memory remains within budget for the largest realistic configuration.
+
+\paragraph{Procedure.}
+\begin{enumerate}[leftmargin=2.0em]
+\item Use \texttt{torch.cuda.max\_memory\_allocated} (GPU) or \texttt{tracemalloc} (CPU) around the call.
+\item Run with $N=300$, $P=Q=80$, $K=2000$.
+\item Report peak memory; verify it fits the target device.
+\end{enumerate}
+
+\paragraph{Pass criterion.} Peak memory $\le$ 80\% of available device memory. If exceeded, enable $K$-axis tiling.
+
+\subsection{Test-suite organisation}
+
+The tests above belong in a single \texttt{tests/test\_nbs\_torch.py} file, organised into \texttt{pytest} classes by pillar:
+
+\begin{lstlisting}
+class TestNumerical:    # T1, T2
+class TestStructural:   # T3, T4
+class TestStatistical:  # T5, T6
+class TestEdgeCases:    # T7
+class TestPerformance:  # T8 (slow, marker @pytest.mark.slow)
+class TestRepro:        # T9
+class TestMemory:       # T10 (marker @pytest.mark.gpu where applicable)
+\end{lstlisting}
+
+T8 and T10 are gated behind opt-in markers so the day-to-day test suite stays fast. T1--T7 and T9 should run in well under a minute total.
+
+%==================================================================
+\section{Implementation checklist}
+
+\begin{enumerate}[leftmargin=2.0em]
+\item Create \texttt{bct/nbs\_torch.py} mirroring the public signature of \texttt{nbs\_bct}, with optional \texttt{device='cuda' if available else 'cpu'}.
+\item Reuse \texttt{bct.utils.BCTParamError} and \texttt{bct.utils.get\_rng} for parity with the reference; instantiate a separate \texttt{torch.Generator} keyed by the same seed.
+\item Implement \texttt{fast\_get\_components} as a private helper. Do \emph{not} replace the original \texttt{get\_components} --- other callers in \texttt{bctpy} depend on its exact return values.
+\item Place \texttt{xmat}/\texttt{ymat} construction inside \texttt{torch.no\_grad()}; gradients are not needed.
+\item Cast all arithmetic to fp32 by default. Expose a \texttt{dtype} kwarg for users who need fp64.
+\item Decide the device once at function entry; do not toggle within the function.
+\item Move only the suprathreshold mask back to host. Do not move the full \texttt{T} matrix back unless an explicit debug flag is set.
+\item Add the test file from the verification plan and wire it into the existing \texttt{bctpy} test suite.
+\item Document in the function docstring that component IDs are not guaranteed identical to the reference (already true of the reference's own output relative to MATLAB BCT).
+\end{enumerate}
+
+\end{document}
